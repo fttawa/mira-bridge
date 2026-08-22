@@ -1,0 +1,13 @@
+# 凭据 —— 绝不提交
+.api-key
+
+# 日志 —— 含完整对话内容
+requests.log
+*.log
+*.log.err
+
+# 隧道 / 部署相关的本地配置
+*.yml
+!.github/**/*.yml
+
+node_modules/

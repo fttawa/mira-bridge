@@ -1,0 +1,25 @@
+{
+  "name": "mira-bridge",
+  "version": "1.0.0",
+  "description": "把本机 Mirasim 的模型额度包装成同时兼容 OpenAI 与 Anthropic 协议的本地 API，零依赖单文件",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "probe": "node probe.mjs",
+    "probe:models": "node probe3.mjs",
+    "probe:anthropic": "node probe4.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "openai-compatible",
+    "anthropic",
+    "claude",
+    "api-bridge",
+    "proxy"
+  ],
+  "license": "MIT",
+  "private": false
+}
