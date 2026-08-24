@@ -1,5 +1,25 @@
 # mira-bridge
 
+> ## ⚠️ 当前不可用（2026年08月24日）
+>
+> 上游 relay 新增了客户端校验，经本桥接层发出的推理请求一律返回：
+>
+> ```json
+> {"error":{"message":"this client is not supported; please upgrade to the latest mirasim client","type":"permission_error"}}
+> ```
+>
+> 排查结论：**不是版本问题，也不是本项目的 bug。**
+>
+> - Mirasim 桌面端本身工作正常，官方路径不受影响
+> - 换用 Claude Code 的 User-Agent 后，报错从「客户端不受支持」变为「请求被拒绝」——说明 relay 按请求特征识别调用方
+> - 同一个上游端口，官方客户端正常、手工构造的请求被拒，差别只在请求特征
+>
+> 也就是说，relay 现在会区分官方客户端与其他调用方。这类用法本来就在服务条款的灰区，如今只是被技术手段明确了。
+>
+> **本项目不会加入任何伪装官方客户端以绕过该校验的代码。** 若你需要在其他设备上使用，请咨询 Mirasim 官方是否提供 API key 或多设备方案。
+>
+> 仍然有价值的部分：下方「[上游的隐藏约束](#上游的隐藏约束)」记录的是 **Anthropic 协议层面的真实差异**，与本项目能否连通无关。任何做 OpenAI ⇄ Anthropic 协议转换的人都会撞上同样的坑，那些结论全部来自实测，可直接参考。
+
 把本机 Mirasim 桌面端的模型额度，包装成一个**同时兼容 OpenAI 与 Anthropic 协议**的本地 API。
 
 ```
@@ -116,6 +136,23 @@ Claude Code 2.1+ 在 system 块上带的是 `{"type":"ephemeral","ttl":"1h","sco
 
 `/v1/messages` 上递归剥掉所有 `cache_control.scope`（system 块、messages 内容块、tools 定义都可能带），`ttl` 保留。
 
+### 消息结构
+
+这几条在长对话里特别容易撞上，因为客户端拼装历史时很容易产生：
+
+| 情况 | 结果 | 处理 |
+|---|---|---|
+| **content 数组里含空 text 块**（`{"type":"text","text":""}`） | **400** | 自动丢弃。任何位置的空块都会触发；纯空白（`"   "`）反而合法 |
+| **连续两条以上 assistant 消息** | **400** | 合并为一条。连续 user 反而会被上游自动合并，assistant 不会 |
+| **assistant 结尾（prefill）** | 推理模型 **400** | 无法兜底，返回明确错误。只有 haiku 支持 prefill |
+| `tool_choice: null` 等显式 null 字段 | **400** | 剥掉所有值为 `null` 的顶层字段 |
+
+`tool_choice: null` 是 Claude Code 2.1.237 会发的——上游 schema 不接受显式 `null`，未设置的可选字段必须省略而非发 `null`。
+
+prefill 那条之所以只能报错：丢掉末条会丢信息，转成 user 会把「续写」变成「用户发言」，语义完全变了。返回的错误里会提示改用 haiku 或在末尾补一条 user 消息。
+
+> 排查提示：这类结构问题上游同样只回那句含混的 400。`bisect.mjs` 可以对一条失败载荷截断 `messages` 找最小失败前缀，再逐块定位——上面几条就是这么找出来的。
+
 ### `thinking` 参数与官方文档相反
 
 上游只认 `{"type":"adaptive"}`（Claude Code 用的就是它）；官方文档写的 `{"type":"enabled","budget_tokens":N}` 和 `{"type":"disabled"}` 反而 400。**不要"修正"它**，原样透传即可工作。
@@ -165,6 +202,7 @@ x-litellm-call-id, x-router-input-tokens, x-router-output-tokens
 | `BRIDGE_API_KEY` | — | 指定 key，覆盖 `.api-key` 文件 |
 | `BRIDGE_ROUTER_PORT` | 自动发现 | 固定上游端口，跳过扫描 |
 | `BRIDGE_MODEL_FILTER` | `^claude-` | `/v1/models` 的正则过滤。设为空串放行全部 |
+| `BRIDGE_BLOCKED_MODELS` | `fable` | 模型黑名单正则。命中的直接回 403，不发往上游，也不出现在 `/v1/models`。默认禁用 fable-5（单价偏高）。设为空串放行全部 |
 | `BRIDGE_DEFAULT_MAX_TOKENS` | `8192` | 客户端没传 `max_tokens` 时的默认值 |
 | `BRIDGE_SAMPLING_MODELS` | `haiku` | 正则，匹配的模型才下发采样参数 |
 | `BRIDGE_THINKING_RESERVE` | `4096` | 推理模型的 thinking 预算补偿 |

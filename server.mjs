@@ -30,6 +30,10 @@ const KEY_FILE = path.join(__dirname, '.api-key');
 const DEFAULT_MAX_TOKENS = Number(process.env.BRIDGE_DEFAULT_MAX_TOKENS || 8192);
 // mirasim-router 里 gpt-*/kimi-* 实测不可路由，默认只暴露 claude 系
 const MODEL_FILTER = process.env.BRIDGE_MODEL_FILTER ?? '^claude-';
+// 模型黑名单：命中的直接拒绝，不发往上游，也不出现在 /v1/models。
+// fable-5 单价明显高于其它模型，默认禁用。设为空串可放行全部。
+const BLOCKED_RE = process.env.BRIDGE_BLOCKED_MODELS ?? 'fable';
+const isBlocked = (model) => !!BLOCKED_RE && new RegExp(BLOCKED_RE).test(model ?? '');
 // 固定端口提示：优先探测这个，探不到再全量扫描
 const PORT_HINT = Number(process.env.BRIDGE_ROUTER_PORT || 0);
 
@@ -150,8 +154,14 @@ function toBlocks(content) {
   if (!Array.isArray(content)) return [];
   const out = [];
   for (const part of content) {
-    if (part?.type === 'text') out.push({ type: 'text', text: part.text ?? '' });
-    else if (part?.type === 'image_url') out.push(imageBlock(part.image_url?.url));
+    if (part?.type === 'text') {
+      // 空 text 块会被上游判非法（实测任何位置的 "" 都触发 400，纯空白反而可以）。
+      // 客户端发多模态消息时常带一个空 text part，直接丢掉。
+      const t = part.text ?? '';
+      if (t) out.push({ type: 'text', text: t });
+    } else if (part?.type === 'image_url') {
+      out.push(imageBlock(part.image_url?.url));
+    }
   }
   return out;
 }
@@ -159,6 +169,16 @@ function toBlocks(content) {
 function toAnthropicRequest(body) {
   const systemParts = [];
   const messages = [];
+
+  // Anthropic 要求角色交替。实测连续 user 会被上游合并，但**连续 assistant 直接 400**
+  // （同样只回那句含混的报错）。OpenAI 侧允许连续同角色，多轮工具调用后尤其常见，
+  // 所以在这里统一合并到上一条同角色消息里。
+  const push = (role, blocks) => {
+    if (!blocks.length) return;
+    const last = messages.at(-1);
+    if (last?.role === role && Array.isArray(last.content)) last.content.push(...blocks);
+    else messages.push({ role, content: blocks });
+  };
 
   for (const msg of body.messages ?? []) {
     if (msg.role === 'system' || msg.role === 'developer') {
@@ -169,14 +189,11 @@ function toAnthropicRequest(body) {
 
     if (msg.role === 'tool') {
       // 工具结果必须以 user 消息回传
-      const blk = {
+      push('user', [{
         type: 'tool_result',
         tool_use_id: msg.tool_call_id,
         content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-      };
-      const last = messages.at(-1);
-      if (last?.role === 'user' && Array.isArray(last.content)) last.content.push(blk);
-      else messages.push({ role: 'user', content: [blk] });
+      }]);
       continue;
     }
 
@@ -187,12 +204,11 @@ function toAnthropicRequest(body) {
         try { input = JSON.parse(tc.function?.arguments || '{}'); } catch { /* 参数不合法就传空对象 */ }
         blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
       }
-      if (blocks.length) messages.push({ role: 'assistant', content: blocks });
+      push('assistant', blocks);
       continue;
     }
 
-    const blocks = toBlocks(msg.content);
-    if (blocks.length) messages.push({ role: 'user', content: blocks });
+    push('user', toBlocks(msg.content));
   }
 
   // Anthropic 要求 max_tokens 必填且 >= 1；OpenAI 侧可选，部分客户端还会传 0 表示「不限制」
@@ -561,7 +577,7 @@ const server = http.createServer(async (req, res) => {
       // 两边字段不冲突，一个响应喂两种客户端。
       const iso = new Date(created0 * 1000).toISOString();
       const data = (j.data ?? [])
-        .filter((m) => !re || re.test(m.id))
+        .filter((m) => (!re || re.test(m.id)) && !isBlocked(m.id))
         .map((m) => ({
           id: m.id,
           object: 'model', created: created0, owned_by: m.owned_by || 'mirasim',
@@ -582,6 +598,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, errBody('请求体不是合法 JSON：' + e.message));
     }
     if (!body.model) return send(res, 400, errBody('缺少 model 字段'));
+    if (isBlocked(body.model)) {
+      reqLog({ level: 'error', status: 403, reason: 'model_blocked', model: body.model, ua: req.headers['user-agent'] ?? null });
+      return send(res, 403, errBody(
+        `模型 ${body.model} 已在本地禁用（单价过高）。可用模型见 GET /v1/models；`
+        + '要临时放行，把环境变量 BRIDGE_BLOCKED_MODELS 设为空串。',
+        'invalid_request_error', 'model_blocked',
+      ));
+    }
     if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, errBody('messages 不能为空'));
 
     const anthropicReq = toAnthropicRequest(body);
@@ -592,6 +616,17 @@ const server = http.createServer(async (req, res) => {
       reqLog({ level: 'error', status: 400, reason: 'empty_messages', ua: req.headers['user-agent'] ?? null, openai_request: trunc(body) });
       return send(res, 400, errBody(
         'messages 转换后为空：至少需要一条内容非空的 user/assistant 消息（仅有 system、或 content 为空/null 都不行）',
+        'invalid_request_error',
+      ));
+    }
+
+    // 推理模型不支持 assistant prefill（messages 以 assistant 结尾），实测只有 haiku 可以。
+    // 这条没法静默兜底：丢掉末条会丢信息，转成 user 会把「续写」变成「用户发言」，语义全变。
+    if (isReasoningModel(body.model) && anthropicReq.messages.at(-1)?.role === 'assistant') {
+      reqLog({ level: 'error', status: 400, reason: 'prefill_unsupported', model: body.model, ua: req.headers['user-agent'] ?? null });
+      return send(res, 400, errBody(
+        `${body.model} 不支持 assistant prefill（messages 以 assistant 结尾）——这是推理模型的限制。`
+        + '可改用 claude-haiku-4-5，或在末尾补一条 user 消息。',
         'invalid_request_error',
       ));
     }
@@ -645,12 +680,26 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, errBody('请求体不是合法 JSON：' + e.message));
     }
     if (!body.model) return send(res, 400, errBody('缺少 model 字段'));
+    if (isBlocked(body.model)) {
+      reqLog({ level: 'error', status: 403, reason: 'model_blocked', endpoint: 'messages', model: body.model, ua: req.headers['user-agent'] ?? null });
+      return send(res, 403, errBody(
+        `模型 ${body.model} 已在本地禁用（单价过高）。可用模型见 GET /v1/models；`
+        + '要临时放行，把环境变量 BRIDGE_BLOCKED_MODELS 设为空串。',
+        'invalid_request_error', 'model_blocked',
+      ));
+    }
 
     // 已知推理模型不接受采样参数，先行剥掉；漏网的交给 callMessages 兜底重试
     if (isReasoningModel(body.model) && hasSampling(body)) {
       for (const k of ['temperature', 'top_p', 'top_k']) delete body[k];
     }
     stripCacheScope(body); // Claude Code 2.1+ 的 cache_control.scope，上游不认
+
+    // 上游 schema 不接受显式 null —— 未设置的可选字段应当省略，发 null 会被判非法。
+    // Claude Code 2.1.237 就会发 tool_choice: null，实测直接 400（且不指出字段）。
+    for (const [k, v] of Object.entries(body)) {
+      if (v === null) delete body[k];
+    }
     // 这里刻意不碰 max_tokens：Anthropic 原生调用方本就知道该额度含 thinking，
     // 擅自放大会违背其预期。补偿语义差异只在 OpenAI 那条路径上做。
 
