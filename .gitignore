@@ -1,13 +1,32 @@
 # 凭据 —— 绝不提交
 .api-key
+.device-id
 
-# 日志 —— 含完整对话内容
+# 逆向过程产物（含设备私钥 / 会话票据，**绝不能提交**）
+_devkey.pem
+_deviceSession.json
+_hello.json
+_prompt_frames.json
+_gui-index.js
+_gui-router.js
+_x_tokens.mjs
+.mirasim-headless/
+
+# 日志 —— 含完整对话内容（轮转出来的 requests.log.1 也要挡）
 requests.log
+requests.log.*
 *.log
 *.log.err
 
 # 隧道 / 部署相关的本地配置
 *.yml
 !.github/**/*.yml
+
+# 运行期杂项
+*.pid
+capture.cab
+
+# 打包产物（npm run pack 生成，不入库）
+dist/
 
 node_modules/
